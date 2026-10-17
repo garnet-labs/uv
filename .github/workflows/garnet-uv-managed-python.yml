@@ -1,0 +1,300 @@
+# Records `uv sync` on the fixture at two commits (the parent and the head of
+# the pull request), each on a fresh runner under the Garnet sensor, with a
+# local DNS forwarder and a port-53 capture as ground truth, then posts one
+# comparison comment on the pull request.
+name: uv managed Python record
+
+on:
+  pull_request:
+    paths:
+      - ".github/fixtures/uv-managed-python/**"
+      - ".github/garnet-replay/**"
+      - ".github/workflows/garnet-uv-managed-python.yml"
+  workflow_dispatch: {}
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: false
+
+env:
+  UV_VERSION: "0.12.10"
+  ITERATIONS: 3
+  FIXTURE: .github/fixtures/uv-managed-python
+
+jobs:
+  record:
+    name: Record uv sync (${{ matrix.side }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+      id-token: write # the Garnet action exchanges the OIDC token for control-plane access
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        side: [baseline, update]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - name: Select the ${{ matrix.side }} commit
+        id: side
+        env:
+          SIDE: ${{ matrix.side }}
+        run: |
+          set -euo pipefail
+          if [ "$SIDE" = "baseline" ]; then
+            git checkout --quiet HEAD~1
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          git log --oneline -1
+
+      - name: Capture port-53 packets as ground truth
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends tcpdump >/dev/null
+          sudo sh -c "nohup tcpdump -n -i any -U -w '$RUNNER_TEMP/dns.pcap' port 53 >/dev/null 2>&1 & echo \$! > '$RUNNER_TEMP/tcpdump.pid'"
+          sleep 3
+          sudo test -s "$RUNNER_TEMP/dns.pcap" || { echo "::error::tcpdump did not start"; exit 1; }
+
+      - name: Answer DNS from a local forwarder
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends dnsmasq >/dev/null 2>&1 ||
+            { sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends dnsmasq >/dev/null; }
+          printf 'no-resolv\nserver=1.1.1.1\nlisten-address=127.0.0.1\nbind-interfaces\nlog-queries\n' |
+            sudo tee /etc/dnsmasq.d/record.conf >/dev/null
+          sudo systemctl restart dnsmasq
+          printf 'nameserver 127.0.0.1\noptions no_tld_query\n' | sudo tee /etc/resolv.conf.new >/dev/null
+          sudo mv /etc/resolv.conf.new /etc/resolv.conf
+          printf '127.0.0.1 %s\n' "$(hostname)" | sudo tee -a /etc/hosts >/dev/null
+          cat /etc/resolv.conf
+          test "$(grep -c '^nameserver ' /etc/resolv.conf)" = 1
+          grep -q '^options no_tld_query$' /etc/resolv.conf
+          getent hosts pypi.org
+          sudo journalctl -u dnsmasq --no-pager -o cat | grep -qE 'query\[A+\] pypi\.org'
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          version: ${{ env.UV_VERSION }}
+          checksum: "173d95a0c32d18c896c46ba6fafbf3cf9c14ab74b033f81b76c883ef492a976b"
+          enable-cache: false
+
+      - name: Check the interpreters the runner already has
+        run: |
+          set -euo pipefail
+          test "$(uv --version | cut -d' ' -f2)" = "$UV_VERSION"
+          python3 --version
+          UV_PYTHON_DOWNLOADS=never uv python list --only-installed
+
+      - uses: garnet-org/action@5f25812c12a605021d0559dd43f077902c4f998a # main 2026-09-09
+        id: garnet
+        with:
+          jibril_version: v2.17.0
+          # Fallback when OIDC is unavailable (pull requests from forks):
+          # api_token: ${{ secrets.GARNET_API_TOKEN }}
+        # Distinct names keep the two matrix legs apart in the control plane.
+        env:
+          GARNET_PROFILE_JOB: record-${{ matrix.side }}
+
+      - name: Sync the fixture with a cold cache and a cold Python directory
+        run: |
+          set -euo pipefail
+          date -u +'%Y-%m-%d %H:%M:%S' > "$RUNNER_TEMP/install_start"
+          for i in $(seq 1 "$ITERATIONS"); do
+            work="$RUNNER_TEMP/install-$i"
+            rm -rf "$work"
+            cp -r "$FIXTURE" "$work"
+            start=$(date +%s%N)
+            (cd "$work" && UV_CACHE_DIR="$work/cache" UV_PYTHON_INSTALL_DIR="$work/python" uv sync --no-progress)
+            end=$(date +%s%N)
+            echo "$(( (end - start) / 1000000 ))" > "$work/sync_ms"
+          done
+          date -u +'%Y-%m-%d %H:%M:%S' > "$RUNNER_TEMP/install_end"
+
+      - name: Check that the sync produced the requested interpreter
+        run: |
+          set -euo pipefail
+          requested="$(cat "$FIXTURE/.python-version")"
+          last_install="$RUNNER_TEMP/install-${ITERATIONS}"
+          grep -E "^version_info = ${requested//./\\.}(\.|$)" "$last_install/.venv/pyvenv.cfg"
+          if [ -n "$(ls -A "$last_install/python" 2>/dev/null)" ]; then
+            grep -E "^home = $last_install/python/" "$last_install/.venv/pyvenv.cfg"
+          else
+            grep -E "^home = " "$last_install/.venv/pyvenv.cfg" | grep -v -E "^home = $last_install/"
+          fi
+
+      # Short-lived install flows need the sensor's flush cadence before stop.
+      - name: Let the sensor settle
+        if: always()
+        run: sleep 30
+
+      - name: Export the execution record
+        if: always()
+        env:
+          SIDE_SHA: ${{ steps.side.outputs.sha }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -uo pipefail
+          sudo systemctl stop jibril.service || true
+          for i in $(seq 1 10); do
+            if sudo test -f /var/log/jibril.profile.json; then break; fi
+            sleep 1
+          done
+          mkdir -p "$RUNNER_TEMP/profile"
+          if sudo test -f /var/log/jibril.profile.json; then
+            sudo cp /var/log/jibril.profile.json "$RUNNER_TEMP/profile/jibril.profile.json"
+            sudo chown "$(id -u):$(id -g)" "$RUNNER_TEMP/profile/jibril.profile.json"
+            wc -c "$RUNNER_TEMP/profile/jibril.profile.json"
+          else
+            echo "No execution record: the sensor did not write an Execution Profile (see the Garnet step log; OIDC needs id-token: write and is unavailable on pull requests from forks)." >> "$GITHUB_STEP_SUMMARY"
+            echo "No execution record found at /var/log/jibril.profile.json" >&2
+          fi
+          echo "$SIDE_SHA" > "$RUNNER_TEMP/profile/sha"
+          echo "$RUN_ID" > "$RUNNER_TEMP/profile/run_id"
+
+      - name: Report what the sync reached and left behind
+        if: always()
+        env:
+          SIDE: ${{ matrix.side }}
+          SIDE_SHA: ${{ steps.side.outputs.sha }}
+        run: |
+          set -euo pipefail
+          if test -s "$RUNNER_TEMP/tcpdump.pid"; then
+            sudo kill "$(cat "$RUNNER_TEMP/tcpdump.pid")" || true
+          fi
+          sleep 2
+          if test -s "$RUNNER_TEMP/dns.pcap"; then
+            sudo chmod a+r "$RUNNER_TEMP/dns.pcap"
+            port_capture_status=present
+          else
+            port_capture_status=absent
+          fi
+          sudo journalctl -u dnsmasq --no-pager -o cat > "$RUNNER_TEMP/forwarder.log" || true
+          if test -s "$RUNNER_TEMP/install_start" && test -s "$RUNNER_TEMP/install_end"; then
+            sudo journalctl -u dnsmasq \
+              --since "$(cat "$RUNNER_TEMP/install_start")" \
+              --until "$(cat "$RUNNER_TEMP/install_end")" \
+              -o cat > "$RUNNER_TEMP/forwarder-installs.log" || true
+          else
+            : > "$RUNNER_TEMP/forwarder-installs.log"
+          fi
+          last_install="$RUNNER_TEMP/install-${ITERATIONS}"
+          {
+            echo "### uv managed Python record ($SIDE $SIDE_SHA)"
+            echo
+            echo '```'
+            echo "uv version: ${UV_VERSION}"
+            echo "runner python3: $(python3 --version 2>&1)"
+            echo "fixture .python-version: $(cat "$FIXTURE/.python-version")"
+            echo "last install directory: ${last_install}"
+            echo
+            echo "port-53 capture: ${port_capture_status}"
+            echo "port-53 destinations:"
+            if test "$port_capture_status" = present; then
+              tcpdump -nr "$RUNNER_TEMP/dns.pcap" 2>/dev/null |
+                { grep -oE '> [0-9.]+\.53:' || true; } |
+                tr -d '>: ' | sort | uniq -c | sort -rn || true
+            else
+              echo "(none)"
+            fi
+            echo
+            echo "names resolved during the recorded syncs:"
+            { grep -oE 'query\[[A-Z]+\] [^ ]+' "$RUNNER_TEMP/forwarder-installs.log" || true; } |
+              sed -E 's/^query\[[A-Z]+\] //' | sort | uniq -c | sort -rn
+            echo
+            echo "names resolved during the whole job:"
+            { grep -oE 'query\[[A-Z]+\] [^ ]+' "$RUNNER_TEMP/forwarder.log" || true; } |
+              sed -E 's/^query\[[A-Z]+\] //' | sort | uniq -c | sort -rn
+            echo
+            for i in $(seq 1 "$ITERATIONS"); do
+              work="$RUNNER_TEMP/install-$i"
+              echo "sync $i: $(cat "$work/sync_ms" 2>/dev/null || echo '?') ms"
+            done
+            echo
+            echo "interpreter recorded in .venv/pyvenv.cfg:"
+            grep -E '^(home|version|implementation|uv) ' "$last_install/.venv/pyvenv.cfg" 2>/dev/null || echo "(none)"
+            echo
+            if test -d "$last_install/python" && [ -n "$(ls -A "$last_install/python" 2>/dev/null)" ]; then
+              echo "managed Python directory: present"
+              echo "managed Python installs:"
+              find "$last_install/python" -mindepth 1 -maxdepth 1 -type d -not -name '.*' -printf '  %f\n' | sort
+              echo "managed Python size: $(du -sh "$last_install/python" | cut -f1)"
+            else
+              echo "managed Python directory: absent"
+            fi
+            echo
+            echo "packages installed:"
+            (cd "$last_install" && UV_CACHE_DIR="$last_install/cache" UV_PYTHON_INSTALL_DIR="$last_install/python" uv pip list --format freeze 2>/dev/null | sed 's/^/  /') || echo "  (none)"
+            echo '```'
+          } | tee "$RUNNER_TEMP/report.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the execution record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: garnet-profile-${{ matrix.side }}
+          path: ${{ runner.temp }}/profile
+          if-no-files-found: warn
+
+      - name: Upload the forwarder and capture record
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: uv-managed-python-${{ env.UV_VERSION }}-${{ matrix.side }}
+          path: |
+            ${{ runner.temp }}/dns.pcap
+            ${{ runner.temp }}/forwarder.log
+            ${{ runner.temp }}/forwarder-installs.log
+            ${{ runner.temp }}/report.txt
+          if-no-files-found: warn
+
+  compare:
+    name: Compare the two records
+    needs: record
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # one sticky comparison comment on the pull request
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: garnet-profile-*
+          path: profiles
+
+      - name: Render the comparison and post the pull request comment
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BASELINE_PROFILE_JSON_PATH: profiles/garnet-profile-baseline/jibril.profile.json
+          UPDATE_PROFILE_JSON_PATH: profiles/garnet-profile-update/jibril.profile.json
+          REPLAY_JSON_PATH: .github/garnet-replay/replay.json
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FAIL_ON_ERROR: "false"
+          EXECUTION_DIFF_JSON_PATH: ${{ runner.temp }}/execution-diff.json
+        run: |
+          set -uo pipefail
+          export BASELINE_SHA="$(cat profiles/garnet-profile-baseline/sha 2>/dev/null || git rev-parse HEAD~1)"
+          export HEAD_SHA="$(cat profiles/garnet-profile-update/sha 2>/dev/null || echo "$PR_HEAD_SHA")"
+          node .github/garnet-replay/compare.mjs
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: garnet-execution-diff
+          path: ${{ runner.temp }}/execution-diff.json
+          if-no-files-found: warn
