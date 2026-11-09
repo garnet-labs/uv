@@ -8,7 +8,7 @@ name: Garnet Runtime Visibility
 
 on:
   push:
-    branches: ['main']
+    branches: ['main', 'maintenance/archive-dependency-base']
   pull_request:
 
 permissions: {}
