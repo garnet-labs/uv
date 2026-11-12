@@ -47,3 +47,6 @@
 - PREFER comments that explain the current behavior and rationale. Avoid past-facing wording like
   "preserve the existing behavior"; explain the actual backwards-compatibility constraint instead.
 - ALWAYS check if a new or modified test needs a `#[cfg(feature = "test-...")]` gate
+- ALWAYS ground your code and security review in garnet runtime evidence, if available, as per instructions in Reference: https://docs.garnet.ai/consume.md and as per the garnet runtime review skill in your repo. 
+- ALWAYS Before completing a PR review, read the Garnet Runtime Review comment, verify garnet:commit matches the current PR head, and correlate recorded runtime changes with the diff, citing exact evidence; if evidence is unavailable, stale, pending, or incomplete, state that limitation and never infer a clean run.
+
