@@ -1,0 +1,25 @@
+name: Linux validation
+
+on:
+  push:
+    branches: [ci-linux-validation]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: "actions/checkout@v6"
+        with:
+          persist-credentials: false
+      - uses: "garnet-org/action@v2.6.0"
+      - name: "Install dependencies"
+        run: |
+          cargo fetch --locked
+      - name: "Run checks"
+        run: |
+          cargo test --locked -p uv-normalize --lib
